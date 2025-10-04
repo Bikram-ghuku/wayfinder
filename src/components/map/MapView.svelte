@@ -10,8 +10,6 @@
 	import LocationButton from '$lib/LocationButton/LocationButton.svelte';
 	import RouteMap from './RouteMap.svelte';
 
-	import { faBus } from '@fortawesome/free-solid-svg-icons';
-	import { RouteType, routePriorities, prioritizedRouteTypeForDisplay } from '$config/routeConfig';
 	import { isMapLoaded } from '$src/stores/mapStore';
 	import { userLocation } from '$src/stores/userLocationStore';
 	/**
@@ -21,6 +19,7 @@
 	 * @property {boolean} [showRoute]
 	 * @property {boolean} [showRouteMap]
 	 * @property {any} [mapProvider]
+	 * @property {any} [stop] - Currently selected stop to preserve visual context
 	 */
 
 	/** @type {Props} */
@@ -28,29 +27,67 @@
 		handleStopMarkerSelect,
 		selectedTrip = null,
 		selectedRoute = null,
-		showRoute = false,
+		isRouteSelected = false,
 		showRouteMap = false,
-		mapProvider = null
+		mapProvider = null,
+		stop = null
 	} = $props();
 
 	let isTripPlanModeActive = $state(false);
 	let mapInstance = $state(null);
 	let mapElement = $state();
 	let allStops = $state([]);
-
-	let markers = [];
+	// O(1) lookup for existing stops
+	let allStopsMap = new Map();
 	let stopsCache = new Map();
 
-	function cacheKey(zoomLevel, boundingBox) {
-		const decimalPlaces = 2; // 2 decimal places equals between 0.5 and 1.1 km depending on where you are in the world.
-		const roundedBox = {
-			north: boundingBox.north.toFixed(decimalPlaces),
-			south: boundingBox.south.toFixed(decimalPlaces),
-			east: boundingBox.east.toFixed(decimalPlaces),
-			west: boundingBox.west.toFixed(decimalPlaces)
-		};
+	const Modes = {
+		NORMAL: 'normal',
+		TRIP_PLAN: 'tripPlan',
+		ROUTE: 'route'
+	};
 
-		return `${roundedBox.north}_${roundedBox.south}_${roundedBox.east}_${roundedBox.west}_${zoomLevel}`;
+	let mapMode = $state(Modes.NORMAL);
+	let modeChangeTimeout = null;
+
+	$effect(() => {
+		let newMode;
+		if (isTripPlanModeActive) {
+			newMode = Modes.TRIP_PLAN;
+		} else if (selectedRoute || isRouteSelected || showRouteMap || selectedTrip) {
+			newMode = Modes.ROUTE;
+		} else {
+			newMode = Modes.NORMAL;
+		}
+		if (modeChangeTimeout) {
+			clearTimeout(modeChangeTimeout);
+		}
+		if (mapMode === Modes.ROUTE && newMode === Modes.NORMAL) {
+			modeChangeTimeout = setTimeout(() => {
+				mapMode = newMode;
+			}, 100);
+		} else if (mapMode !== newMode) {
+			mapMode = newMode;
+		}
+	});
+
+	$effect(() => {
+		if (!mapInstance) return;
+		if (mapMode === Modes.NORMAL) {
+			batchAddMarkers(allStops);
+		} else {
+			clearAllMarkers();
+		}
+	});
+
+	function cacheKey(zoomLevel, boundingBox) {
+		const multiplier = 100; // 2 decimal places
+		const north = Math.round(boundingBox.north * multiplier);
+		const south = Math.round(boundingBox.south * multiplier);
+		const east = Math.round(boundingBox.east * multiplier);
+		const west = Math.round(boundingBox.west * multiplier);
+
+		return `${north}_${south}_${east}_${west}_${zoomLevel}`;
 	}
 
 	function getBoundingBox() {
@@ -105,13 +142,12 @@
 			await loadStopsAndAddMarkers(initialLat, initialLng, true);
 
 			const debouncedLoadMarkers = debounce(async () => {
-				const center = mapInstance.getCenter();
-				const zoomLevel = mapInstance.map.getZoom();
-
-				// Prevent fetching stops in the background when a route is selected or trip plan mode is active, we only fetch stops when we are see other stops
-				if (selectedRoute || showRoute || isTripPlanModeActive) {
+				if (mapMode !== Modes.NORMAL) {
 					return;
 				}
+
+				const center = mapInstance.getCenter();
+				const zoomLevel = mapInstance.map.getZoom();
 				await loadStopsAndAddMarkers(center.lat, center.lng, false, zoomLevel);
 			}, 300);
 
@@ -132,25 +168,36 @@
 
 		const routeLookup = new Map(routeReference.map((route) => [route.id, route]));
 
-		// merge the stops routeIds with the route data
+		// merge the stops routeIds with the route data and deduplicate efficiently
 		newStops.forEach((stop) => {
-			stop.routes = stop.routeIds.map((routeId) => routeLookup.get(routeId)).filter(Boolean);
+			if (!allStopsMap.has(stop.id)) {
+				stop.routes =
+					stop.routeIds?.map((routeId) => routeLookup.get(routeId)).filter(Boolean) || [];
+				allStopsMap.set(stop.id, stop);
+			}
 		});
 
-		allStops = [...new Map([...allStops, ...newStops].map((stop) => [stop.id, stop])).values()];
+		allStops = Array.from(allStopsMap.values());
 	}
 
 	function clearAllMarkers() {
-		markers.forEach((markerObj) => {
-			mapInstance.removeMarker(markerObj);
-		});
-		markers = [];
+		if (mapInstance && mapInstance.clearAllStopMarkers) {
+			mapInstance.clearAllStopMarkers();
+		}
 	}
 
-	function updateMarkers() {
-		if (!selectedRoute && !isTripPlanModeActive) {
-			allStops.forEach((s) => addMarker(s));
+	// Batch operation to add multiple markers efficiently
+	function batchAddMarkers(stops) {
+		const stopsToAdd = stops.filter((s) => !mapInstance.hasMarker(s.id));
+
+		if (stopsToAdd.length === 0) {
+			return;
 		}
+
+		// Group DOM operations to minimize reflows/repaints
+		requestAnimationFrame(() => {
+			stopsToAdd.forEach((s) => addMarker(s));
+		});
 	}
 
 	function addMarker(s) {
@@ -159,36 +206,23 @@
 			return;
 		}
 
-		// // check if the marker already exists
-		const existingMarker = markers.find((marker) => marker.stop.id === s.id);
-
-		// if it does, don't add it again
-		if (existingMarker) {
+		if (mapInstance.hasMarker(s.id)) {
 			return;
 		}
 
-		let icon = faBus;
-
-		if (s.routes && s.routes.length > 0) {
-			const routeTypes = new Set(s.routes.map((r) => r.type));
-			let prioritizedType = routePriorities.find((type) => routeTypes.has(type));
-			if (prioritizedType === undefined) {
-				prioritizedType = RouteType.UNKNOWN;
-			}
-			icon = prioritizedRouteTypeForDisplay(prioritizedType);
-		}
+		// Check if this marker should be highlighted (if it's the currently selected stop)
+		const shouldHighlight = stop && s.id === stop.id;
 
 		const markerObj = mapInstance.addMarker({
 			position: { lat: s.lat, lng: s.lon },
-			icon: icon,
 			stop: s,
+			isHighlighted: shouldHighlight,
 			onClick: () => {
 				handleStopMarkerSelect(s);
 			}
 		});
 
-		markerObj.stop = s;
-		markers.push(markerObj);
+		return markerObj;
 	}
 
 	function handleThemeChange(event) {
@@ -202,17 +236,26 @@
 		userLocation.set({ lat: latitude, lng: longitude });
 	}
 
+	// Store event handlers for proper cleanup
+	let planTripHandler, tabSwitchHandler;
+
 	onMount(async () => {
 		await initMap();
 		isMapLoaded.set(true);
 		if (browser) {
 			const darkMode = document.documentElement.classList.contains('dark');
-			window.addEventListener('planTripTabClicked', () => {
+
+			// Store handlers for cleanup
+			planTripHandler = () => {
 				isTripPlanModeActive = true;
-			});
-			window.addEventListener('tabSwitched', () => {
+			};
+			tabSwitchHandler = () => {
 				isTripPlanModeActive = false;
-			});
+			};
+
+			window.addEventListener('planTripTabClicked', planTripHandler);
+			window.addEventListener('tabSwitched', tabSwitchHandler);
+
 			const event = new CustomEvent('themeChange', { detail: { darkMode } });
 			window.dispatchEvent(event);
 		}
@@ -221,26 +264,19 @@
 	onDestroy(() => {
 		if (browser) {
 			window.removeEventListener('themeChange', handleThemeChange);
+
+			if (planTripHandler) window.removeEventListener('planTripTabClicked', planTripHandler);
+			if (tabSwitchHandler) window.removeEventListener('tabSwitched', tabSwitchHandler);
 		}
-		markers.forEach(({ markerObj, element }) => {
-			mapProvider.removeMarker(markerObj);
-			if (element && element.parentNode) {
-				element.parentNode.removeChild(element);
-			}
-		});
-	});
-	$effect(() => {
-		if (selectedRoute) {
-			clearAllMarkers();
-			updateMarkers();
-		} else if (!isTripPlanModeActive) {
-			allStops.forEach((s) => addMarker(s));
+
+		if (modeChangeTimeout) {
+			clearTimeout(modeChangeTimeout);
 		}
-	});
-	$effect(() => {
-		if (isTripPlanModeActive) {
-			clearAllMarkers();
-		}
+
+		clearAllMarkers();
+
+		allStopsMap.clear();
+		stopsCache.clear();
 	});
 </script>
 
@@ -248,7 +284,7 @@
 	<div id="map" bind:this={mapElement}></div>
 
 	{#if selectedTrip && showRouteMap}
-		<RouteMap mapProvider={mapInstance} tripId={selectedTrip.tripId} />
+		<RouteMap mapProvider={mapInstance} tripId={selectedTrip.tripId} currentSelectedStop={stop} />
 	{/if}
 </div>
 
