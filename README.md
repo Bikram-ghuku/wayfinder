@@ -19,9 +19,10 @@ See `.env.example` for an example of the required keys and values.
 
 ### Analytics
 
-- `PUBLIC_ANALYTICS_DOMAIN` - string: (optional).
-- `PUBLIC_ANALYTICS_ENABLED` - boolean: (optional).
-- `PUBLIC_ANALYTICS_API_HOST` - string: (optional).
+- `PUBLIC_ANALYTICS_PROVIDER` - enum (optional): which backend to use. `"none"` (default — disabled), `"plausible"`, or `"umami"`.
+- `PUBLIC_ANALYTICS_DOMAIN` - string (optional): site identifier sent to the backend. For Plausible, this is the site domain registered in the account. For Umami, this is the literal hostname sent as `payload.hostname`.
+- `PUBLIC_ANALYTICS_API_HOST` - string (optional): upstream base URL (Plausible appends `/api/event`; Umami appends `/api/send`).
+- `PUBLIC_ANALYTICS_WEBSITE_ID` - string (optional): required at runtime when `PUBLIC_ANALYTICS_PROVIDER="umami"`; ignored otherwise.
 
 ### Internationalization
 
@@ -82,10 +83,17 @@ Use these in Tailwind classes: `bg-primary-500`, `text-primary-700`, `border-pri
 - `PUBLIC_OBA_REGION_CENTER_LAT` - float: (required) The region's center latitude.
 - `PUBLIC_OBA_REGION_CENTER_LNG` - float: (required) The region's center longitude.
 - `PRIVATE_OBA_API_KEY` - string: (required) Your OneBusAway REST API server key.
-- `PRIVATE_OBACO_API_BASE_URL` - string: (optional) Your OneBusAway.co server base URL, including the path prefix `/api/v1.
-- `PRIVATE_REGION_ID` - string: (required if OBACO_API_BASE_URL provided).
-- `PRIVATE_OBACO_SHOW_TEST_ALERTS` - boolean: (optional) Show test alerts on the website. Don't set this value in production.
 - `PRIVATE_OBA_AGENCY_FILTER` - string: (optional) Comma-separated agency IDs to restrict this instance to a subset of agencies. Leave empty to show all agencies (default). Affects search results, stop listings, arrivals, schedules, and alerts.
+
+### Sidecar
+
+Sidecar (formerly Obaco, or OneBusAway.co) supplies service alerts and rider surveys.
+
+- `PRIVATE_SIDECAR_API_BASE_URL` - string: (optional) Your Sidecar server base URL, including the path prefix `/api/v1`, e.g. `https://sidecar.onebusaway.org/api/v1`.
+- `PRIVATE_SIDECAR_REGION_ID` - string: (required if `PRIVATE_SIDECAR_API_BASE_URL` is provided). Without it the alerts endpoint returns 204 and the surveys endpoint returns an empty list; survey submission and updates still work, since they aren't region-scoped.
+- `PRIVATE_SIDECAR_SHOW_TEST_ALERTS` - boolean: (optional) Show test alerts on the website. Don't set this value in production.
+
+The pre-rename names `PRIVATE_OBACO_API_BASE_URL`, `PRIVATE_REGION_ID`, and `PRIVATE_OBACO_SHOW_TEST_ALERTS` are still honored as fallbacks, and each logs a deprecation warning on first use. They will be removed in a future release. A `PRIVATE_SIDECAR_*` variable takes precedence over its pre-rename name only when it holds a non-empty value — set to an empty string it counts as unset, and the pre-rename name still takes effect.
 
 ### Maps
 
@@ -100,6 +108,7 @@ Use these in Tailwind classes: `bg-primary-500`, `text-primary-700`, `border-pri
 ### Trip Planner
 
 - `PUBLIC_OTP_SERVER_URL` - string: (optional) Your OpenTripPlanner 1.x-compatible trip planner server URL.
+- `PUBLIC_OBA_TIMEZONE` - string: (required) IANA timezone for the transit region (e.g. `"America/Los_Angeles"`). Dates and times in the trip planner are expressed in this timezone so they match the transit agency's schedule, regardless of the user's or server's local timezone.
 - `PUBLIC_DISTANCE_UNIT` - string: (optional) Default distance unit for the trip planner. Use "metric" for kilometers/meters or "imperial" for miles/feet. If not set, auto-detects from the user's browser locale (US browsers get imperial, others get metric). Users can override this in Trip Options.
 
 ## URL Parameters
@@ -137,3 +146,7 @@ npm run build
 You can preview the production build with `npm run preview`.
 
 > To deploy your app, you may need to install an [adapter](https://kit.svelte.dev/docs/adapters) for your target environment.
+
+## Contributing
+
+Want to contribute? Check out [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on finding issues, opening PRs, and code style.

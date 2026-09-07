@@ -59,6 +59,13 @@ describe('msToTimeString', () => {
 	it.each(INVALID_INPUTS)(`returns "N/A" when the input is %s`, (input) => {
 		expect(msToTimeString(input)).toBe('N/A');
 	});
+
+	it('falls back to local timezone for invalid timezone string', () => {
+		const ms = new Date('2024-01-16T09:15:00Z').valueOf();
+		const localResult = msToTimeString(ms);
+		const result = msToTimeString(ms, 'Not/A/Timezone');
+		expect(result).toBe(localResult);
+	});
 });
 
 describe('msToLocalArrivalDepartureTimeString', () => {
@@ -179,6 +186,19 @@ describe('parseTimeInput', () => {
 			expect(parseTimeInput(input)).toBeNull();
 		}
 	);
+
+	it('re-throws non-RangeError exceptions', () => {
+		// Temporarily make apiTimeFormat.format throw a TypeError
+		const origFrom = Temporal.PlainTime.from;
+		Temporal.PlainTime.from = () => {
+			throw new TypeError('unexpected');
+		};
+		try {
+			expect(() => parseTimeInput('14:30')).toThrow(TypeError);
+		} finally {
+			Temporal.PlainTime.from = origFrom;
+		}
+	});
 });
 
 describe('parseDateInput', () => {
@@ -217,6 +237,18 @@ describe('parseDateInput', () => {
 	])('returns null when the input is %s', (input) => {
 		expect(parseDateInput(input)).toBeNull();
 	});
+
+	it('re-throws non-RangeError exceptions', () => {
+		const origFrom = Temporal.PlainDate.from;
+		Temporal.PlainDate.from = () => {
+			throw new TypeError('unexpected');
+		};
+		try {
+			expect(() => parseDateInput('2026-01-14')).toThrow(TypeError);
+		} finally {
+			Temporal.PlainDate.from = origFrom;
+		}
+	});
 });
 
 describe('formatTimeForOTP', () => {
@@ -249,6 +281,18 @@ describe('formatTimeForOTP', () => {
 		const date = new Date(2026, 0, 14, 20, 45);
 		expect(formatTimeForOTP(date)).toBe('8:45 PM');
 	});
+
+	it('formats time in a specific timezone', () => {
+		// 10:30 PM UTC = 2:30 PM Pacific (PST, UTC-8)
+		const date = new Date('2026-01-14T22:30:00Z');
+		expect(formatTimeForOTP(date, 'America/Los_Angeles')).toBe('2:30 PM');
+	});
+
+	it('formats time in eastern timezone', () => {
+		// 10:30 PM UTC = 5:30 PM Eastern (EST, UTC-5)
+		const date = new Date('2026-01-14T22:30:00Z');
+		expect(formatTimeForOTP(date, 'America/New_York')).toBe('5:30 PM');
+	});
 });
 
 describe('formatDateForOTP', () => {
@@ -275,6 +319,18 @@ describe('formatDateForOTP', () => {
 	it('handles year correctly', () => {
 		const date = new Date(2030, 6, 4); // July 4, 2030
 		expect(formatDateForOTP(date)).toBe('07-04-2030');
+	});
+
+	it('formats date in a specific timezone', () => {
+		// 2 AM UTC on Jan 15 = 6 PM PST on Jan 14 (still previous day in Pacific)
+		const date = new Date('2026-01-15T02:00:00Z');
+		expect(formatDateForOTP(date, 'America/Los_Angeles')).toBe('01-14-2026');
+	});
+
+	it('formats date in eastern timezone', () => {
+		// 3 AM UTC on Jan 15 = 10 PM EST on Jan 14
+		const date = new Date('2026-01-15T03:00:00Z');
+		expect(formatDateForOTP(date, 'America/New_York')).toBe('01-14-2026');
 	});
 });
 
@@ -395,12 +451,48 @@ describe('formatDepartureDisplay', () => {
 		});
 		expect(result).toBe('Depart');
 	});
+
+	it('uses agency timezone for Today/Tomorrow when timeZone is provided', () => {
+		// System time: 2025-06-16T02:00:00Z (UTC date is June 16)
+		// In America/Los_Angeles (PDT, UTC-7): still June 15 at 7 PM
+		vi.setSystemTime(new Date('2025-06-16T02:00:00Z'));
+
+		const result = formatDepartureDisplay(
+			{
+				departureType: 'departAt',
+				departureTime: '19:00',
+				departureDate: '2025-06-15'
+			},
+			null,
+			'America/Los_Angeles'
+		);
+		expect(result).toBe('Depart 7:00 PM, Today');
+	});
+
+	it('shows Tomorrow using agency timezone', () => {
+		// System time: 2025-06-16T02:00:00Z
+		// In America/Los_Angeles (PDT): still June 15 → June 16 is "Tomorrow"
+		vi.setSystemTime(new Date('2025-06-16T02:00:00Z'));
+
+		const result = formatDepartureDisplay(
+			{
+				departureType: 'departAt',
+				departureTime: '09:00',
+				departureDate: '2025-06-16'
+			},
+			null,
+			'America/Los_Angeles'
+		);
+		expect(result).toBe('Depart 9:00 AM, Tomorrow');
+	});
 });
 
 describe('formatLastUpdated', () => {
 	const translations = {
 		min: 'min',
+		mins: 'mins',
 		sec: 'sec',
+		secs: 'secs',
 		ago: 'ago'
 	};
 
@@ -416,19 +508,19 @@ describe('formatLastUpdated', () => {
 	it('formats time less than a minute ago', () => {
 		const timestamp = new Date('2024-01-16T11:59:30Z').valueOf();
 		const result = formatLastUpdated(timestamp, translations);
-		expect(result).toBe('30 sec ago');
+		expect(result).toBe('30 secs ago');
 	});
 
 	it('formats time more than a minute ago', () => {
 		const timestamp = new Date('2024-01-16T11:58:30Z').valueOf();
 		const result = formatLastUpdated(timestamp, translations);
-		expect(result).toBe('1 min 30 sec ago');
+		expect(result).toBe('1 min 30 secs ago');
 	});
 
 	it('formats time multiple minutes ago', () => {
 		const timestamp = new Date('2024-01-16T11:57:15Z').valueOf();
 		const result = formatLastUpdated(timestamp, translations);
-		expect(result).toBe('2 min 45 sec ago');
+		expect(result).toBe('2 mins 45 secs ago');
 	});
 
 	it('handles just-now timestamps', () => {
@@ -440,18 +532,55 @@ describe('formatLastUpdated', () => {
 	it('works with different translation objects', () => {
 		const spanishTranslations = {
 			min: 'min',
+			mins: 'mins',
 			sec: 'seg',
+			secs: 'segs',
 			ago: 'atrás'
 		};
 		const timestamp = new Date('2024-01-16T11:58:30Z').valueOf();
 		const result = formatLastUpdated(timestamp, spanishTranslations);
-		expect(result).toBe('1 min 30 seg atrás');
+		expect(result).toBe('1 min 30 segs atrás');
+	});
+
+	it('falls back to singular sec label when secs is omitted', () => {
+		const abbreviatedTranslations = {
+			min: 'min',
+			sec: 'sec',
+			ago: 'ago'
+		};
+		const timestamp = new Date('2024-01-16T11:59:30Z').valueOf();
+		const result = formatLastUpdated(timestamp, abbreviatedTranslations);
+		expect(result).toBe('30 sec ago');
+	});
+
+	it('falls back to singular min label when mins is omitted', () => {
+		const abbreviatedTranslations = {
+			min: 'min',
+			sec: 'sec',
+			ago: 'ago'
+		};
+		const timestamp = new Date('2024-01-16T11:57:15Z').valueOf();
+		const result = formatLastUpdated(timestamp, abbreviatedTranslations);
+		expect(result).toBe('2 min 45 sec ago');
+	});
+
+	it('uses full-word plural forms when provided', () => {
+		const fullWordTranslations = {
+			min: 'minute',
+			mins: 'minutes',
+			sec: 'second',
+			secs: 'seconds',
+			ago: 'ago'
+		};
+		const timestamp = new Date('2024-01-16T11:59:30Z').valueOf();
+		const result = formatLastUpdated(timestamp, fullWordTranslations);
+		expect(result).toBe('30 seconds ago');
 	});
 
 	it('handles zero seconds case', () => {
 		const timestamp = new Date('2024-01-16T12:00:00Z').valueOf();
 		const result = formatLastUpdated(timestamp, translations);
-		expect(result).toBe('0 sec ago');
+		expect(result).toBe('0 secs ago');
 	});
 
 	// Invalid inputs
@@ -499,6 +628,47 @@ describe('convertToISO8601', () => {
 
 	it('returns null when time is undefined', () => {
 		expect(convertToISO8601('01-14-2026', undefined)).toBeNull();
+	});
+
+	it('uses explicit timezone when provided', () => {
+		// January = PST = UTC-8
+		expect(convertToISO8601('01-14-2026', '5:19 PM', 'America/Los_Angeles')).toBe(
+			'2026-01-14T17:19:00-08:00'
+		);
+	});
+
+	it('uses correct DST offset for summer dates', () => {
+		// July = PDT = UTC-7
+		expect(convertToISO8601('07-04-2026', '5:19 PM', 'America/Los_Angeles')).toBe(
+			'2026-07-04T17:19:00-07:00'
+		);
+	});
+
+	it('uses explicit timezone for eastern time', () => {
+		// January = EST = UTC-5
+		expect(convertToISO8601('01-14-2026', '9:00 AM', 'America/New_York')).toBe(
+			'2026-01-14T09:00:00-05:00'
+		);
+	});
+
+	it('returns null for an invalid timezone (RangeError)', () => {
+		expect(convertToISO8601('01-14-2026', '9:00 AM', 'Not/A/Timezone')).toBeNull();
+	});
+
+	it('handles DST spring-forward gap correctly', () => {
+		// 2:30 AM on March 8, 2026 does not exist in Pacific time (clocks spring forward 2→3 AM)
+		// Temporal resolves this to 3:30 AM PDT — output must use the resolved time, not the input
+		expect(convertToISO8601('03-08-2026', '2:30 AM', 'America/Los_Angeles')).toBe(
+			'2026-03-08T03:30:00-07:00'
+		);
+	});
+
+	it('handles DST fall-back ambiguous time correctly', () => {
+		// 1:30 AM on November 1, 2026 exists twice in Pacific time (clocks fall back 2→1 AM).
+		// Temporal's "compatible" disambiguation picks the earlier offset (PDT, -07:00).
+		expect(convertToISO8601('11-01-2026', '1:30 AM', 'America/Los_Angeles')).toBe(
+			'2026-11-01T01:30:00-07:00'
+		);
 	});
 });
 

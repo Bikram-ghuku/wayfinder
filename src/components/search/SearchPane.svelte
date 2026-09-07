@@ -3,7 +3,8 @@
 	import SearchResultItem from '$components/search/SearchResultItem.svelte';
 	import { onMount, onDestroy, tick } from 'svelte';
 	import { prioritizedRouteTypeForDisplay } from '$config/routeConfig';
-	import { faMapPin, faSignsPost } from '@fortawesome/free-solid-svg-icons';
+	import { FontAwesomeIcon } from '@fortawesome/svelte-fontawesome';
+	import { faMapPin, faSignsPost, faX } from '@fortawesome/free-solid-svg-icons';
 	import { t } from 'svelte-i18n';
 	import { clearVehicleMarkersMap, fetchAndUpdateVehicles } from '$lib/vehicleUtils';
 	import { calculateMidpoint } from '$lib/mathUtils';
@@ -12,8 +13,12 @@
 	import TripPlan from '$components/trip-planner/TripPlan.svelte';
 	import { isMapLoaded } from '$src/stores/mapStore';
 	import { answeredSurveys, surveyStore } from '$stores/surveyStore';
-	import { removeAgencyPrefix } from '$lib/utils';
+	import { removeAgencyPrefix, stopSubtitle } from '$lib/utils';
 	import { browser } from '$app/environment';
+	import { page } from '$app/stores';
+	import { parseTripParams, hasTripParams } from '$lib/urlState';
+	import { notifyRouteLoadFailed, notifyPartialRouteShape } from '$lib/routeNotifications';
+	import { notifications } from '$stores/notificationStore';
 
 	let {
 		handleRouteSelected,
@@ -23,6 +28,11 @@
 		clearTripItineraries,
 		cssClasses = '',
 		mapProvider = null,
+		onCollapse = null,
+		collapsed = false,
+		// When false, Plan tab stays available but TripPlan mounts elsewhere
+		// (mobile bottom sheet). Avoids two TripPlan instances.
+		embedTripPlan = true,
 		childContent
 	} = $props();
 
@@ -32,6 +42,13 @@
 	let query = $state(null);
 	let polylines = [];
 	let currentIntervalId = null;
+	// Bumped on every route click so a slower, superseded load can detect a newer
+	// click took over (after one of its awaits) and bail instead of fighting the
+	// newer route for the camera, stop markers, and vehicle polling.
+	let routeLoadToken = 0;
+	// Id of the toast the current route load raised, so we only ever clear our
+	// own and never one owned by another component.
+	let notificationId = null;
 	let mapLoaded = $state(false);
 	let isSurveyAnswered = $state(false);
 	let activeTab = $state('stops');
@@ -101,6 +118,11 @@
 	}
 
 	async function handleRouteClick(route) {
+		const loadToken = ++routeLoadToken;
+		// Drop our prior retriable toast so a stale Retry for a previous route
+		// can't wipe markers/polylines after the user has moved on.
+		notifications.dismiss(notificationId);
+		notificationId = null;
 		mapProvider.clearAllPolylines();
 		mapProvider.removeStopMarkers();
 		mapProvider.clearVehicleMarkers();
@@ -108,7 +130,17 @@
 		clearResults();
 		try {
 			const response = await fetch(`/api/oba/stops-for-route/${route.id}`);
+			if (loadToken !== routeLoadToken) return;
+
+			if (!response.ok) {
+				console.error(`Failed to fetch route data: ${response.status}`);
+				notificationId = notifyRouteLoadFailed(() => handleRouteClick(route));
+				return;
+			}
+
 			const stopsForRoute = await response.json();
+			if (loadToken !== routeLoadToken) return;
+
 			const stopsMap = new Map(stopsForRoute.data.references.stops.map((stop) => [stop.id, stop]));
 			const polylinesData = stopsForRoute.data.entry.polylines;
 
@@ -119,23 +151,56 @@
 				orderedStops = stopsForRoute.data.references.stops;
 			}
 
-			const midpoint = calculateMidpoint(orderedStops);
-			mapProvider.flyTo(midpoint.lat, midpoint.lng, 12);
-
+			// Draw the route shapes first so the view can fit their full extent.
+			// Reset the collection so each route click rebuilds it from scratch
+			// rather than accumulating stale references from previous selections.
+			polylines = [];
+			const segmentCount = polylinesData?.length ?? 0;
 			for (const polylineData of polylinesData) {
-				const shape = polylineData.points;
-				let polyline;
-				polyline = mapProvider.createPolyline(shape);
-				polylines.push(polyline);
+				const polyline = await mapProvider.createPolyline(polylineData.points);
+				if (loadToken !== routeLoadToken) return;
+				// createPolyline returns null for an undecodable shape (on either
+				// provider); skip it so one bad segment degrades the route instead
+				// of leaving a null hole in the polylines array.
+				if (polyline) polylines.push(polyline);
+			}
+
+			if (loadToken !== routeLoadToken) return;
+
+			if (segmentCount > 0 && polylines.length < segmentCount) {
+				notificationId = notifyPartialRouteShape();
+			}
+
+			// Fit the view to the full route so it's always centered and visible
+			// regardless of route length. Fall back to the stops' midpoint when no
+			// polyline could be drawn. Awaiting the fit lets the stop markers appear
+			// in sync with the route reveal instead of popping in beforehand.
+			const fitted = await mapProvider.fitToPolylines?.();
+			// A newer route click took over while the camera was settling; leave the
+			// map to that newer load instead of yanking it back to this route.
+			if (loadToken !== routeLoadToken) return;
+			if (!fitted) {
+				const midpoint = calculateMidpoint(orderedStops);
+				if (midpoint) {
+					mapProvider.flyTo(midpoint.lat, midpoint.lon, 12);
+				}
 			}
 
 			await showStopsOnRoute(orderedStops);
+			if (loadToken !== routeLoadToken) return;
 			// Clear any existing interval first to prevent memory leaks
 			if (currentIntervalId) {
 				clearInterval(currentIntervalId);
 				currentIntervalId = null;
 			}
-			currentIntervalId = await fetchAndUpdateVehicles(route.id, mapProvider, route.type);
+			const intervalId = await fetchAndUpdateVehicles(route.id, mapProvider, route.type);
+			if (loadToken !== routeLoadToken) {
+				// Superseded while polling was starting; tear down this stale
+				// interval rather than overwriting the newer load's id.
+				clearInterval(intervalId);
+				return;
+			}
+			currentIntervalId = intervalId;
 
 			const routeData = {
 				route,
@@ -147,6 +212,9 @@
 			handleRouteSelected(routeData);
 		} catch (error) {
 			console.error('Error fetching route data:', error);
+			if (loadToken === routeLoadToken) {
+				notificationId = notifyRouteLoadFailed(() => handleRouteClick(route));
+			}
 		}
 	}
 
@@ -185,6 +253,11 @@
 
 	function handleTabSwitch() {
 		if (isContextMenuTrigger) return;
+
+		if (activeTab === 'plan') {
+			window.dispatchEvent(new CustomEvent('tripPlanModalClosed'));
+			clearTripItineraries();
+		}
 		const event = new CustomEvent('tabSwitched');
 		window.dispatchEvent(event);
 	}
@@ -207,26 +280,85 @@
 		isContextMenuTrigger = true;
 		activeTab = 'plan';
 		await tick();
+		// Enter trip-plan mode the same way a Plan tab click does (mobile sheet,
+		// map chrome).
+		window.dispatchEvent(new CustomEvent('planTripTabClicked'));
+		// On mobile, TripPlan remounts inside the plan sheet after this event —
+		// wait one tick so its listeners exist before setTripPlanLocation.
+		await tick();
 		window.dispatchEvent(new CustomEvent('setTripPlanLocation', { detail: e.detail }));
 		isContextMenuTrigger = false;
+	}
+
+	function handleOpenStopsTab() {
+		if (activeTab !== 'plan') return;
+		handleTabSwitch();
+		activeTab = 'stops';
+	}
+
+	let hasRestoredSharedTrip = false;
+
+	// Restore a trip shared via the URL. Waits for the map so TripPlan can drop
+	// pins, then opens the Plan tab and hands the parsed trip to TripPlan. The
+	// parsed trip is captured up front because planTripTabClicked resets the URL
+	// to "/" (the planned trip rewrites it once the itinerary loads). Wrapped in
+	// try/catch since this runs from an isMapLoaded subscription callback with no
+	// caller to report failures to.
+	async function maybeRestoreSharedTrip() {
+		if (hasRestoredSharedTrip || !env.PUBLIC_OTP_SERVER_URL) return;
+
+		const searchParams = $page.url.searchParams;
+		const trip = parseTripParams(searchParams);
+
+		// "from"/"to" present but unparsable (truncated, corrupted, out of range):
+		// tell the recipient the link didn't work instead of silently falling
+		// back to the default map with no explanation.
+		if (!trip && !hasTripParams(searchParams)) return;
+
+		hasRestoredSharedTrip = true;
+		try {
+			activeTab = 'plan';
+			// tick() also lets the Plan tab mount so TripPlan's loadSharedTrip /
+			// invalidSharedTrip listeners are registered before either is dispatched.
+			await tick();
+			// Mirror a real Plan tab click so the map hides stop markers and enters
+			// trip-plan mode. Dispatched after tick so MapView's listener is ready.
+			window.dispatchEvent(new CustomEvent('planTripTabClicked'));
+			// On mobile, TripPlan remounts inside the plan sheet after this event —
+			// wait one more tick so its listeners exist before loadSharedTrip.
+			await tick();
+			if (trip) {
+				window.dispatchEvent(new CustomEvent('loadSharedTrip', { detail: trip }));
+			} else {
+				window.dispatchEvent(new CustomEvent('invalidSharedTrip'));
+			}
+		} catch (error) {
+			console.error('Failed to restore shared trip from URL:', error);
+		}
 	}
 
 	onMount(() => {
 		unsubscribeMapLoaded = isMapLoaded.subscribe((value) => {
 			mapLoaded = value;
+			if (value && mapProvider) {
+				maybeRestoreSharedTrip();
+			}
 		});
 
 		window.addEventListener('routeSelectedFromModal', handleRouteSelectedFromModal);
 		window.addEventListener('contextMenuTripPlan', handleContextMenuTripPlan);
+		window.addEventListener('openStopsTab', handleOpenStopsTab);
 	});
 
 	onDestroy(() => {
+		notifications.dismiss(notificationId);
 		if (unsubscribeMapLoaded) {
 			unsubscribeMapLoaded();
 		}
 		if (browser) {
 			window.removeEventListener('routeSelectedFromModal', handleRouteSelectedFromModal);
 			window.removeEventListener('contextMenuTripPlan', handleContextMenuTripPlan);
+			window.removeEventListener('openStopsTab', handleOpenStopsTab);
 		}
 		if (currentIntervalId) {
 			clearInterval(currentIntervalId);
@@ -235,8 +367,11 @@
 	});
 </script>
 
+<!-- Collapsing hides the pane below md only (a floating stand-in field takes its
+     place there); md and up always shows it, so `collapsed` restores this root's
+     own flex display at that breakpoint. -->
 <div
-	class={`modal-pane flex flex-col justify-between bg-white/80 backdrop-blur-sm md:w-96 ${cssClasses}`}
+	class={`modal-pane flex flex-col justify-between bg-white/80 backdrop-blur-sm md:w-96 ${collapsed ? 'hidden md:flex' : ''} ${cssClasses}`}
 >
 	<Tabs
 		tabStyle="none"
@@ -296,7 +431,7 @@
 							on:click={() => handleStopClick(stop)}
 							icon={faSignsPost}
 							title={stop.name}
-							subtitle={`${stop.direction ? $t(`direction.${stop.direction}`) : ''}; Code: ${stop.code}`}
+							subtitle={stopSubtitle(stop, $t)}
 						/>
 					{/each}
 				{/if}
@@ -305,7 +440,7 @@
 			<div class="mt-0 sm:mt-0">
 				<button
 					type="button"
-					class="mt-3 text-sm font-medium text-brand-accent underline hover:text-brand focus:outline-none"
+					class="mt-3 text-sm font-medium text-brand-accent underline hover:text-brand focus:outline-none dark:text-brand dark:hover:text-white"
 					onclick={handleViewAllRoutes}
 				>
 					{$t('search.click_here')}
@@ -326,8 +461,21 @@
 				}}
 				disabled={!mapLoaded}
 			>
-				<TripPlan {mapProvider} {handleTripPlan} {clearTripItineraries} />
+				{#if embedTripPlan}
+					<TripPlan {mapProvider} {handleTripPlan} {clearTripItineraries} />
+				{/if}
 			</TabItem>
+		{/if}
+
+		{#if onCollapse}
+			<!-- Collapsing to the floating pill is a sub-md affordance; on wider
+			     viewports the pane always stays open. -->
+			<li role="presentation" class="ms-auto self-center md:hidden">
+				<button type="button" onclick={onCollapse} class="close-button">
+					<FontAwesomeIcon icon={faX} class="font-black text-black dark:text-white" />
+					<span class="sr-only">{$t('search.collapse')}</span>
+				</button>
+			</li>
 		{/if}
 	</Tabs>
 </div>

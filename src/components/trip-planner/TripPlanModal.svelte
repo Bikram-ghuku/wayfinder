@@ -1,26 +1,55 @@
 <script>
-	import ModalPane from '$components/navigation/ModalPane.svelte';
+	import BottomSheet from '$components/navigation/BottomSheet.svelte';
 	import LoadingSpinner from '$components/LoadingSpinner.svelte';
 	import ItineraryDetails from './ItineraryDetails.svelte';
 	import ItineraryTab from './ItineraryTab.svelte';
+	import TripPlan from './TripPlan.svelte';
+	import { FontAwesomeIcon } from '@fortawesome/svelte-fontawesome';
+	import { faX } from '@fortawesome/free-solid-svg-icons';
+	import { keybinding } from '$lib/keybinding';
 	import { onDestroy, onMount } from 'svelte';
 	import { t } from 'svelte-i18n';
 	import { browser } from '$app/environment';
+	import { notifyPartialRouteShape } from '$lib/routeNotifications';
+	import { notifications } from '$stores/notificationStore';
+	import { panelFitPadding } from '$lib/mapFitPadding.js';
+	import { calculateMidpoint } from '$lib/mathUtils.js';
 
 	/**
 	 * @typedef {Object} Props
-	 * @property {any} mapProvider
+	 * @property {import('$lib/types').MapProvider} mapProvider
 	 * @property {any} [itineraries]
+	 * @property {string | null} [error]
 	 * @property {boolean} [loading]
+	 * @property {Function} closePane
+	 * @property {('peek'|'half'|'full')} [snap]
+	 * @property {boolean} [showForm] - When true (mobile plan sheet), embed From/To form in this sheet
+	 * @property {boolean} [hasPlanned] - True after the rider submits a plan (even if zero results)
+	 * @property {Function} [handleTripPlan] - Required when showForm is true
+	 * @property {Function} [clearTripItineraries] - Required when showForm is true
 	 */
 
 	/** @type {Props} */
-	let { mapProvider, itineraries = [], error = null, loading = false, closePane } = $props();
+	let {
+		mapProvider,
+		itineraries = [],
+		error = null,
+		loading = false,
+		closePane,
+		snap = $bindable('half'),
+		showForm = false,
+		hasPlanned = false,
+		handleTripPlan = null,
+		clearTripItineraries = null
+	} = $props();
 
 	let expandedSteps = $state({});
 	let activeTab = $state(0);
 	let itineraryTabsContainer = $state(null);
 	let prevItinerariesRef = $state(null);
+	// Id of the toast this modal raised, so closing it clears only its own.
+	let notificationId = null;
+	let sheetElement = $state(null);
 
 	function toggleSteps(index) {
 		expandedSteps[index] = !expandedSteps[index];
@@ -33,6 +62,7 @@
 	}
 
 	let currPolylines = [];
+	let drawToken = 0;
 
 	// Build per-leg polyline style based on mode and route color
 	function getLegPolylineStyle(leg) {
@@ -55,6 +85,8 @@
 
 	// draw the current itinerary route based on the active itinerary tab
 	async function drawRoute() {
+		const token = ++drawToken;
+
 		if (currPolylines.length > 0) {
 			currPolylines.forEach((polyline) => {
 				mapProvider.removePolyline(polyline);
@@ -66,12 +98,75 @@
 			return;
 		}
 
-		itineraries[activeTab].legs.forEach((leg) => {
-			const shape = leg.legGeometry.points;
+		let drawnCount = 0;
+		let legCount = 0;
+		const drawn = [];
+
+		for (const leg of itineraries[activeTab].legs) {
+			// Counted before the geometry check: a leg with no geometry at all is
+			// just as invisible on the map as one that fails to decode, so it has
+			// to stay in the denominator or the gap goes unreported.
+			legCount++;
+			const shape = leg.legGeometry?.points;
+			if (!shape) continue;
 			const style = getLegPolylineStyle(leg);
-			const polyline = mapProvider.createPolyline(shape, style);
-			currPolylines.push(polyline);
+			// Await: the Google provider's createPolyline is async and returns
+			// null on decode failure — skip nulls instead of tracking a Promise.
+			// A provider that throws instead of returning null must not reject
+			// this fire-and-forget draw: that would skip the fit *and* the
+			// midpoint fallback, stranding the camera with no route and no toast.
+			let polyline = null;
+			try {
+				polyline = await mapProvider.createPolyline(shape, style);
+			} catch (error) {
+				console.error('Error creating itinerary leg polyline:', error);
+			}
+			// A newer draw (tab switch / new results) took over while we were
+			// awaiting — remove the orphan so it can't strand on the map, then bail.
+			if (token !== drawToken) {
+				if (polyline) mapProvider.removePolyline(polyline);
+				for (const prior of drawn) mapProvider.removePolyline(prior);
+				return;
+			}
+			if (polyline) {
+				drawn.push(polyline);
+				drawnCount++;
+			}
+		}
+		currPolylines = drawn;
+
+		if (legCount > 0 && drawnCount < legCount) {
+			notificationId = notifyPartialRouteShape();
+		}
+
+		const padding = panelFitPadding(sheetElement?.getBoundingClientRect(), {
+			width: window.innerWidth,
+			height: window.innerHeight
 		});
+
+		let fitted = false;
+		try {
+			fitted = await mapProvider.fitToPolylines?.({ padding });
+		} catch (error) {
+			console.error('Error fitting trip itinerary to view:', error);
+		}
+		if (token !== drawToken) return;
+
+		if (!fitted) {
+			// No drawable geometry (e.g. a leg missing legGeometry) — frame the
+			// itinerary endpoints instead of leaving the camera where it was.
+			// Endpoints are filtered rather than trusted: an empty legs array or a
+			// leg missing from/to coordinates would otherwise throw here, or hand
+			// calculateMidpoint a NaN it happily averages into a NaN flyTo.
+			const legs = itineraries[activeTab].legs;
+			const endpoints = [legs[0]?.from, legs.at(-1)?.to].filter(
+				(point) => Number.isFinite(point?.lat) && Number.isFinite(point?.lon)
+			);
+			const midpoint = calculateMidpoint(endpoints);
+			if (midpoint) {
+				mapProvider.flyTo(midpoint.lat, midpoint.lon, 13);
+			}
+		}
 	}
 
 	/**
@@ -109,24 +204,57 @@
 	});
 
 	onDestroy(() => {
-		if (currPolylines.length > 0) {
-			currPolylines.forEach(async (polyline) => {
-				mapProvider.removePolyline(await polyline);
-			});
-		}
+		drawToken++;
+		// Partial-shape warnings auto-dismiss, but clear ours immediately on close
+		// so it doesn't linger over the next view.
+		notifications.dismiss(notificationId);
+		// currPolylines only ever holds polylines already awaited in drawRoute.
+		currPolylines.forEach((polyline) => mapProvider.removePolyline(polyline));
 
 		if (browser && itineraryTabsContainer) {
 			itineraryTabsContainer.removeEventListener('wheel', handleWheel);
 		}
 	});
+
+	let headerTitle = $derived(showForm ? $t('tabs.plan_trip') : $t('trip-planner.trip_itineraries'));
+	let hasResults = $derived(itineraries.length > 0);
+	// "No itineraries" empty state only after a plan attempt, not while editing.
+	let showEmptyState = $derived(!loading && !hasResults && (!showForm || hasPlanned));
 </script>
 
-<ModalPane {closePane} title={$t('trip-planner.trip_itineraries')}>
+<BottomSheet bind:snap bind:element={sheetElement}>
+	{#snippet header()}
+		<div class="flex items-center gap-2.5">
+			<p class="min-w-0 flex-1 truncate text-base font-semibold text-black dark:text-white">
+				{headerTitle}
+			</p>
+			<button
+				type="button"
+				onclick={closePane}
+				use:keybinding={{ code: 'Escape' }}
+				class="flex h-8 w-8 flex-none items-center justify-center rounded-full bg-gray-200 text-sm text-black hover:bg-gray-300 dark:bg-gray-700 dark:text-white dark:hover:bg-gray-600"
+			>
+				<FontAwesomeIcon icon={faX} />
+				<span class="sr-only">{$t('sheet.close')}</span>
+			</button>
+		</div>
+	{/snippet}
+
+	{#if showForm && handleTripPlan && clearTripItineraries}
+		<div
+			class={hasResults || loading || error
+				? 'border-b border-gray-200 pb-4 dark:border-gray-700'
+				: ''}
+		>
+			<TripPlan {mapProvider} {handleTripPlan} {clearTripItineraries} />
+		</div>
+	{/if}
+
 	{#if loading}
 		<LoadingSpinner />
 	{/if}
 
-	{#if itineraries.length > 0}
+	{#if hasResults}
 		<div class="itinerary-tabs" bind:this={itineraryTabsContainer}>
 			{#each itineraries as itinerary, index}
 				<ItineraryTab {index} {activeTab} {setActiveTab} {itinerary} />
@@ -142,8 +270,12 @@
 				{/key}
 			{/if}
 		</div>
-	{:else if !loading}
-		<div class="flex h-full flex-col items-center justify-center gap-3 py-12">
+	{:else if showEmptyState}
+		<!-- On the mobile plan sheet this block sits below the From/To form, so
+		     h-full would push the centered message past the visible body and below
+		     the fold. Let it size to its content there; keep full-height centering
+		     for the standalone desktop results sheet. -->
+		<div class="flex flex-col items-center justify-center gap-3 py-12 {showForm ? '' : 'h-full'}">
 			<p class="text-gray-400 dark:text-gray-500">
 				{$t('trip-planner.no_itineraries_found')}
 			</p>
@@ -159,7 +291,7 @@
 			{/if}
 		</div>
 	{/if}
-</ModalPane>
+</BottomSheet>
 
 <style>
 	.animate-fade-in {

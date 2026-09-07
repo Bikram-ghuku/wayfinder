@@ -4,7 +4,7 @@ import { expect, test, describe, vi, beforeEach } from 'vitest';
 import RouteModal from '../RouteModal.svelte';
 import { mockRoutesListData, mockStopsForRouteData } from '../../../tests/fixtures/obaData.js';
 
-// Allow ModalPane and StopItem to render naturally - they should be properly implemented
+// Allow BottomSheet and StopItem to render naturally - they should be properly implemented
 
 // Mock svelte-i18n
 vi.mock('svelte-i18n', () => ({
@@ -14,6 +14,9 @@ vi.mock('svelte-i18n', () => ({
 				const translations = {
 					show_more: 'Show more',
 					show_less: 'Show less',
+					'sheet.close': 'Close',
+					'favorites.add': 'Add to favorites',
+					'favorites.remove': 'Remove from favorites',
 					route_modal_title: options?.values?.name
 						? `Route ${options.values.name}`
 						: 'route_modal_title'
@@ -109,7 +112,9 @@ describe('RouteModal', () => {
 		}
 
 		// Should call map provider methods
-		expect(mockMapProvider.flyTo).toHaveBeenCalledWith(mockStops[0].lat, mockStops[0].lon, 18);
+		expect(mockMapProvider.flyTo).toHaveBeenCalledWith(mockStops[0].lat, mockStops[0].lon, 18, {
+			animate: false
+		});
 		expect(mockMapProvider.openStopMarker).toHaveBeenCalledWith(mockStops[0]);
 	});
 
@@ -206,11 +211,37 @@ describe('RouteModal', () => {
 			}
 		});
 
-		// Find close button (typically rendered by ModalPane)
+		// Find close button (rendered in the BottomSheet header)
 		const closeButton = screen.getByRole('button', { name: /close/i });
 		await user.click(closeButton);
 
 		expect(mockClosePane).toHaveBeenCalledTimes(1);
+	});
+
+	test('renders a favorite toggle for the selected route', () => {
+		render(RouteModal, {
+			props: {
+				selectedRoute: mockRoute,
+				stops: mockStops,
+				mapProvider: mockMapProvider,
+				closePane: mockClosePane
+			}
+		});
+
+		expect(screen.getByRole('button', { name: 'Add to favorites' })).toBeInTheDocument();
+	});
+
+	test('hides the favorite toggle when no route is selected', () => {
+		render(RouteModal, {
+			props: {
+				selectedRoute: null,
+				stops: mockStops,
+				mapProvider: mockMapProvider,
+				closePane: mockClosePane
+			}
+		});
+
+		expect(screen.queryByRole('button', { name: 'Add to favorites' })).not.toBeInTheDocument();
 	});
 
 	test('is keyboard accessible', async () => {
@@ -508,7 +539,9 @@ describe('RouteModal', () => {
 		for (let i = 0; i < stopButtons.length && i < mockStops.length; i++) {
 			await user.click(stopButtons[i]);
 
-			expect(mockMapProvider.flyTo).toHaveBeenCalledWith(mockStops[i].lat, mockStops[i].lon, 18);
+			expect(mockMapProvider.flyTo).toHaveBeenCalledWith(mockStops[i].lat, mockStops[i].lon, 18, {
+				animate: false
+			});
 			expect(mockMapProvider.openStopMarker).toHaveBeenCalledWith(mockStops[i]);
 		}
 	});

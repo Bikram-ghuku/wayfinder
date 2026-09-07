@@ -1,5 +1,6 @@
 <script>
 	import { msToTimeString } from '$lib/dateTimeFormat';
+	import { env } from '$env/dynamic/public';
 	import { slide } from 'svelte/transition';
 	import {
 		faWalking,
@@ -20,8 +21,16 @@
 	import { formatDistance } from '$lib/distanceUtils';
 	import { effectiveDistanceUnit } from '$stores/tripOptionsStore';
 
-	let { leg, index, expandedSteps, toggleSteps, isLast = false } = $props();
-
+	let {
+		leg,
+		index,
+		expandedSteps,
+		toggleSteps,
+		isLast = false,
+		isInterline = false,
+		nextLegRouteName = ''
+	} = $props();
+	const regionTz = env.PUBLIC_OBA_TIMEZONE || undefined;
 	let isWalking = $derived(leg.mode === 'WALK');
 
 	// Route color properties (from OTP API)
@@ -151,12 +160,12 @@
 			<div class="flex items-center text-gray-600 dark:text-gray-300">
 				<FontAwesomeIcon icon={faClock} class="mr-1.5 h-3 w-3 text-blue-500" />
 				<span>{$t('trip-planner.start')}:</span>
-				<span class="ml-1 font-semibold">{msToTimeString(leg.startTime)}</span>
+				<span class="ml-1 font-semibold">{msToTimeString(leg.startTime, regionTz)}</span>
 			</div>
 			<div class="flex items-center text-gray-600 dark:text-gray-300">
 				<FontAwesomeIcon icon={faClock} class="mr-1.5 h-3 w-3 text-red-500" />
 				<span>{$t('trip-planner.end')}:</span>
-				<span class="ml-1 font-semibold">{msToTimeString(leg.endTime)}</span>
+				<span class="ml-1 font-semibold">{msToTimeString(leg.endTime, regionTz)}</span>
 			</div>
 		</div>
 
@@ -184,12 +193,21 @@
 					>{$t('trip-planner.duration')}: {Math.round(leg.duration / 60)} {$t('time.minutes')}</span
 				>
 			</div>
+			{#if isInterline}
+				<!-- Interline indicator -->
+				<div class="flex items-center text-sm text-amber-900 dark:text-amber-200">
+					<FontAwesomeIcon icon={faArrowAltCircleRight} class="mr-2 h-3 w-3 text-gray-400" />
+					<span class="font-medium">
+						{$t('trip-planner.stay_on_board', { values: { route: nextLegRouteName } })}
+					</span>
+				</div>
+			{/if}
 		</div>
 
 		<!-- Walking steps toggle -->
 		{#if isWalking && leg.steps?.length > 0}
 			<button
-				class="mt-3 flex items-center gap-1.5 rounded-lg px-2 py-1 text-sm font-medium text-brand-accent transition-colors hover:bg-gray-100 dark:hover:bg-gray-800"
+				class="mt-3 flex items-center gap-1.5 rounded-lg px-2 py-1 text-sm font-medium text-brand-accent transition-colors hover:bg-gray-100 dark:text-brand dark:hover:bg-gray-800"
 				onclick={() => toggleSteps(index)}
 			>
 				<FontAwesomeIcon
